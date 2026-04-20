@@ -568,13 +568,23 @@ async def create_vector_store(
                 "Для инициализации таблицы векторной БД нужен пакет `langchain-postgres` с поддержкой `Column`."
             ) from exc
         metadata_columns = [Column(column_name, "TEXT") for column_name in config.metadata_columns]
-        await pg_engine.ainit_vectorstore_table(
-            table_name=config.table_name,
-            vector_size=config.vector_size,
-            schema_name=config.schema_name,
-            id_column=config.id_column,
-            metadata_columns=metadata_columns,
-        )
+        try:
+            await pg_engine.ainit_vectorstore_table(
+                table_name=config.table_name,
+                vector_size=config.vector_size,
+                schema_name=config.schema_name,
+                id_column=config.id_column,
+                metadata_columns=metadata_columns,
+            )
+        except Exception as exc:
+            error_message = str(exc).lower()
+            is_existing_table_error = (
+                "already exists" in error_message
+                or "duplicatetable" in error_message
+                or "duplicate table" in error_message
+            )
+            if not is_existing_table_error:
+                raise
     return await pg_vector_store_cls.create(
         engine=pg_engine,
         table_name=config.table_name,
