@@ -23,9 +23,12 @@ PDF_PATH: Path | None = None
 
 # Если не хочешь делать сетевой запрос к VLM, поставь False.
 CHECK_VLM_HTTP = True
+CHECK_VLM_IMAGE_REQUEST = True
 
 # Если не хочешь делать реальное создание vector store, поставь False.
 CHECK_VECTOR_STORE = True
+CHECK_TEXT_MODEL_REQUEST = True
+CHECK_EMBEDDINGS_REQUEST = True
 
 
 def print_header(title: str) -> None:
@@ -88,6 +91,49 @@ def check_model_objects() -> None:
 
     print_ok(f"TEXT_MODEL = {type(llm_model.TEXT_MODEL).__name__}")
     print_ok(f"EMBEDDINGS_MODEL = {type(llm_model.EMBEDDINGS_MODEL).__name__}")
+
+
+async def _check_text_model_request_async() -> None:
+    """Проверяет реальный короткий вызов текстовой LangChain-модели."""
+    model = llm_model.TEXT_MODEL
+    prompt = "Ответь одним словом: OK"
+
+    if hasattr(model, "ainvoke"):
+        response = await model.ainvoke(prompt)
+    elif hasattr(model, "invoke"):
+        response = await asyncio.to_thread(model.invoke, prompt)
+    else:
+        raise RuntimeError("TEXT_MODEL не поддерживает методы `ainvoke(...)` или `invoke(...)`.")
+
+    response_text = getattr(response, "content", response)
+    print_ok(f"TEXT_MODEL ответила: {str(response_text)[:200]}")
+
+
+def check_text_model_request() -> None:
+    """Проверяет, что текстовая модель реально отвечает на запрос."""
+    asyncio.run(_check_text_model_request_async())
+
+
+async def _check_embeddings_request_async() -> None:
+    """Проверяет реальное получение эмбеддинга через LangChain embeddings model."""
+    embeddings_model = llm_model.EMBEDDINGS_MODEL
+    text = "Тестовый текст для проверки эмбеддингов."
+
+    if hasattr(embeddings_model, "aembed_query"):
+        vector = await embeddings_model.aembed_query(text)
+    elif hasattr(embeddings_model, "embed_query"):
+        vector = await asyncio.to_thread(embeddings_model.embed_query, text)
+    else:
+        raise RuntimeError("EMBEDDINGS_MODEL не поддерживает методы `aembed_query(...)` или `embed_query(...)`.")
+
+    if not vector:
+        raise RuntimeError("EMBEDDINGS_MODEL вернула пустой вектор.")
+    print_ok(f"EMBEDDINGS_MODEL вернула вектор размерности: {len(vector)}")
+
+
+def check_embeddings_request() -> None:
+    """Проверяет, что модель эмбеддингов реально возвращает вектор."""
+    asyncio.run(_check_embeddings_request_async())
 
 
 def check_relational_db() -> None:
@@ -201,12 +247,53 @@ def check_vlm_http() -> None:
         raise RuntimeError(f"Не удалось обратиться к VLM endpoint `{models_url}`: {exc}") from exc
 
 
+async def _check_vlm_image_request_async() -> None:
+    """Проверяет реальный VLM-запрос с первым изображением из PDF."""
+    from src.app.services.image_renderers import render_pdf_page_images
+    from src.vlm_client import QwenVLMClient, QwenVLMConfig
+
+    if PDF_PATH is None:
+        raise RuntimeError("PDF_PATH = None. Для проверки VLM по изображению нужен PDF.")
+
+    image_paths = render_pdf_page_images(PDF_PATH)
+    if not image_paths:
+        raise RuntimeError("Не удалось получить изображения из PDF для VLM-проверки.")
+
+    first_image_path = image_paths[0]
+    client = QwenVLMClient(
+        QwenVLMConfig(
+            base_url=settings.VLM_BASE_URL,
+            model_name=settings.VLM_MODEL_NAME,
+            api_key=settings.VLM_API_KEY,
+            timeout=settings.VLM_TIMEOUT,
+            max_tokens=256,
+        )
+    )
+    response = await client.atranscribe_slide(
+        first_image_path,
+        system_prompt="Ты проверяешь доступность VLM. Кратко опиши, что видно на изображении.",
+        user_prompt="Ответь одной короткой фразой.",
+    )
+    print_ok(f"VLM обработала изображение `{first_image_path}`. Ответ: {response[:300]}")
+
+
+def check_vlm_image_request() -> None:
+    """Проверяет, что VLM реально принимает изображение, а не только отвечает на `/models`."""
+    asyncio.run(_check_vlm_image_request_async())
+
+
 def main() -> None:
     """Запускает все диагностические проверки по очереди."""
     results: list[tuple[str, bool]] = []
 
     results.append(("Базовая конфигурация", run_check("Базовая конфигурация", check_basic_config)))
     results.append(("LangChain-модели", run_check("LangChain-модели", check_model_objects)))
+    if CHECK_TEXT_MODEL_REQUEST:
+        results.append(("Реальный вызов TEXT_MODEL", run_check("Реальный вызов TEXT_MODEL", check_text_model_request)))
+    if CHECK_EMBEDDINGS_REQUEST:
+        results.append(
+            ("Реальный вызов EMBEDDINGS_MODEL", run_check("Реальный вызов EMBEDDINGS_MODEL", check_embeddings_request))
+        )
     results.append(("Реляционная PostgreSQL", run_check("Реляционная PostgreSQL", check_relational_db)))
     results.append(("Vector PostgreSQL", run_check("Vector PostgreSQL", check_vector_db_connection)))
 
@@ -221,6 +308,9 @@ def main() -> None:
 
     if CHECK_VLM_HTTP:
         results.append(("Проверка VLM endpoint", run_check("Проверка VLM endpoint", check_vlm_http)))
+
+    if CHECK_VLM_IMAGE_REQUEST:
+        results.append(("Реальный VLM-запрос с изображением", run_check("Реальный VLM-запрос с изображением", check_vlm_image_request)))
 
     print_header("Итог")
     for title, is_ok in results:
