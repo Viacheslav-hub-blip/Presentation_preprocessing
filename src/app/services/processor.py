@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import UUID, uuid4
@@ -33,6 +35,50 @@ async def invoke_text_model(model: Any, prompt: str, retries: int = 5, delay_sec
             await asyncio.sleep(delay_seconds)
     assert last_error is not None
     raise last_error
+
+
+def strip_markdown_json_block(text: str) -> str:
+    """Убирает markdown-обёртку вокруг JSON-ответа модели, если она есть."""
+    cleaned_text = text.strip()
+    fenced_match = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```",
+        cleaned_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced_match:
+        return fenced_match.group(1).strip()
+    return cleaned_text
+
+
+def extract_json_object_text(text: str) -> str:
+    """Возвращает текст первого JSON-объекта из ответа модели, если он там есть."""
+    start_index = text.find("{")
+    end_index = text.rfind("}")
+    if start_index == -1 or end_index == -1 or end_index <= start_index:
+        return text
+    return text[start_index : end_index + 1]
+
+
+def extract_summary_from_model_response(response_text: str) -> str:
+    """Достаёт поле `summary` из JSON-ответа модели и возвращает чистый текст."""
+    cleaned_text = strip_markdown_json_block(response_text)
+    try:
+        parsed_response = json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        json_object_text = extract_json_object_text(cleaned_text)
+        try:
+            parsed_response = json.loads(json_object_text)
+        except json.JSONDecodeError:
+            return cleaned_text
+
+    if not isinstance(parsed_response, dict):
+        return cleaned_text
+
+    summary = parsed_response.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return cleaned_text
+
+    return summary.strip()
 
 
 async def process_slide(
@@ -81,7 +127,7 @@ async def process_slide(
         vlm_transcribed_text = ""
         vlm_visual_description = ""
 
-    final_slide_description = await invoke_text_model(
+    raw_final_slide_description = await invoke_text_model(
         text_model,
         prompts.PROMPT_DENSE_SLIDE_SUMMARY.format(
             report_name=report_name,
@@ -95,6 +141,7 @@ async def process_slide(
             vlm_visual_description=vlm_visual_description,
         ),
     )
+    final_slide_description = extract_summary_from_model_response(raw_final_slide_description)
 
     return SlideProcessingResult(
         slide_number=slide_index + 1,
