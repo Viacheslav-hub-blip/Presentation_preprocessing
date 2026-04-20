@@ -108,7 +108,14 @@ def check_relational_db() -> None:
 
 
 def check_vector_db_connection() -> None:
-    """Проверяет доступность векторной PostgreSQL простым SQL-запросом."""
+    """Проверяет формат строки подключения к векторной PostgreSQL."""
+    if "+asyncpg" in settings.VECTOR_CONNECTION_STRING:
+        print_ok(
+            "VECTOR_CONNECTION_STRING использует asyncpg. "
+            "Прямую sync-проверку пропускаем, реальное подключение проверит шаг создания vector store."
+        )
+        return
+
     from sqlalchemy import create_engine, text
 
     engine = create_engine(settings.VECTOR_CONNECTION_STRING)
@@ -136,7 +143,7 @@ async def _check_vector_store_async() -> None:
     vector_store = await create_vector_store(
         config,
         embedding_service=llm_model.EMBEDDINGS_MODEL,
-        initialize_table=False,
+        initialize_table=True,
     )
     if vector_store is None:
         raise RuntimeError("create_vector_store(...) вернул None.")
