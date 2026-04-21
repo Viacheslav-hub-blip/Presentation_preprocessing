@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -32,7 +33,16 @@ from src.app.schemas.presentation import (
     PresentationListResponse,
     PresentationUploadResponse,
 )
-from src.app.services.processor import build_storage_records, process_presentation
+from src.app.services.processor import (
+    build_storage_records,
+    extract_summary_from_model_response,
+    invoke_text_model,
+    process_presentation,
+)
+
+
+EMBEDDING_TEXT_MAX_CHARS = 4096
+VECTOR_SUMMARY_TARGET_CHARS = 3500
 
 
 class PresentationService:
@@ -352,12 +362,77 @@ class PresentationService:
         chunk_records: list[SlideChunkRecord],
     ) -> None:
         """Синхронизирует презентацию с векторной PostgreSQL как обязательной частью RAG-пайплайна."""
+        vector_presentation, vector_chunks = await self._prepare_records_for_vector_db(
+            presentation_record,
+            chunk_records,
+        )
         vector_store = await create_vector_store(
             self._config.vector_db,
             embedding_service=self._models.embeddings_model,
             initialize_table=True,
         )
-        await sync_presentation_to_vector_db(vector_store, presentation_record, chunk_records)
+        await sync_presentation_to_vector_db(vector_store, vector_presentation, vector_chunks)
+
+    async def _prepare_records_for_vector_db(
+        self,
+        presentation_record: PresentationRecord,
+        chunk_records: list[SlideChunkRecord],
+    ) -> tuple[PresentationRecord, list[SlideChunkRecord]]:
+        """Готовит копии записей для векторизации и сокращает слишком длинные тексты через LLM."""
+        presentation_summary = await self._fit_text_for_embeddings(
+            presentation_record.summary or "",
+            context=f"summary презентации `{presentation_record.report_name}`",
+        )
+        vector_presentation = PresentationRecord(
+            id=presentation_record.id,
+            report_name=presentation_record.report_name,
+            text=presentation_record.text,
+            summary=presentation_summary,
+            link_on_file=presentation_record.link_on_file,
+        )
+
+        semaphore = asyncio.Semaphore(self._config.max_concurrency)
+
+        async def _prepare_chunk(chunk: SlideChunkRecord) -> SlideChunkRecord:
+            """Создает копию чанка с summary, безопасным для embeddings-модели."""
+            async with semaphore:
+                chunk_summary = await self._fit_text_for_embeddings(
+                    chunk.chunk_summary or "",
+                    context=(
+                        f"summary слайда {chunk.slide_sequence_number}, "
+                        f"чанк {chunk.chunk_number}, презентация `{presentation_record.report_name}`"
+                    ),
+                )
+            return SlideChunkRecord(
+                presentation_id=chunk.presentation_id,
+                slide_sequence_number=chunk.slide_sequence_number,
+                chunk_number=chunk.chunk_number,
+                source_slide_text=chunk.source_slide_text,
+                chunk_summary=chunk_summary,
+            )
+
+        vector_chunks = await asyncio.gather(*[_prepare_chunk(chunk) for chunk in chunk_records])
+        return vector_presentation, list(vector_chunks)
+
+    async def _fit_text_for_embeddings(self, text: str, *, context: str) -> str:
+        """Возвращает исходный текст или LLM-summary, если текст длиннее лимита embeddings-модели."""
+        normalized_text = text.strip()
+        if len(normalized_text) <= EMBEDDING_TEXT_MAX_CHARS:
+            return normalized_text
+
+        prompts = get_processing_prompts()
+        raw_summary = await invoke_text_model(
+            self._models.text_model,
+            prompts.PROMPT_VECTOR_CONTENT_SUMMARY.format(
+                context=context,
+                text=normalized_text,
+                target_chars=VECTOR_SUMMARY_TARGET_CHARS,
+            ),
+        )
+        summary = extract_summary_from_model_response(raw_summary).strip()
+        if len(summary) <= EMBEDDING_TEXT_MAX_CHARS:
+            return summary
+        return summary[:EMBEDDING_TEXT_MAX_CHARS].rstrip()
 
     async def _rollback_removed_presentation(
         self,
@@ -384,12 +459,7 @@ class PresentationService:
 
         if vector_deleted:
             try:
-                vector_store = await create_vector_store(
-                    self._config.vector_db,
-                    embedding_service=self._models.embeddings_model,
-                    initialize_table=False,
-                )
-                await sync_presentation_to_vector_db(vector_store, presentation, chunks)
+                await self._sync_to_vector_db(presentation, chunks)
             except Exception as exc:
                 rollback_errors.append(f"vector restore failed: {exc}")
 

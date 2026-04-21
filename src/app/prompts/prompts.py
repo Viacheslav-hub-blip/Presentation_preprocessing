@@ -17,6 +17,7 @@ class ProcessingPrompts:
     PROMPT_DENSE_SLIDE_SUMMARY: str
     PROMPT_SEMANTIC_TEXT_SPLITTER: str
     PROMPT_DENSE_REPORT_SUMMARY: str
+    PROMPT_VECTOR_CONTENT_SUMMARY: str
     PROMPT_VLM_TRANSCRIBE_SLIDE: str
     PROMPT_VLM_DESCRIBE_IMAGES: str
     PROMPT_VLM_TRANSCRIBE_SLIDE_USER: str = "Полностью перенеси информацию со слайда."
@@ -442,6 +443,41 @@ PROMPT_DENSE_REPORT_SUMMARY = """
 """
 
 
+PROMPT_VECTOR_CONTENT_SUMMARY = """
+<role>
+    Ты — эксперт по подготовке текстов презентаций для RAG и векторного поиска.
+</role>
+
+<task>
+    Сожми переданный текст так, чтобы его можно было безопасно отправить в embeddings-модель.
+    Итоговый summary должен быть короче {target_chars} символов, но сохранить смысл, названия, даты, метрики,
+    аббревиатуры, важные термины и ключевые слова для поиска.
+</task>
+
+<instructions>
+    1. Не добавляй факты, которых нет в исходном тексте.
+    2. Не используй markdown, таблицы, списки с маркерами и декоративные символы.
+    3. Сохраняй русский язык, но оставляй важные английские термины и аббревиатуры.
+    4. Если в тексте есть блок "Теги:", сохрани его в конце отдельным абзацем.
+    5. Верни строго один JSON-объект без markdown и без пояснений вне JSON.
+</instructions>
+
+<output_format>
+    {{
+        "summary": "краткий, плотный текст для векторизации"
+    }}
+</output_format>
+
+<context>
+    {context}
+</context>
+
+<input_data>
+    {text}
+</input_data>
+"""
+
+
 PROMPT_VLM_TRANSCRIBE_SLIDE = """
 ## Role ##
 Ты — умный ассистент, который должен помочь пользователю обработать изображение.
@@ -494,6 +530,7 @@ def get_processing_prompts() -> ProcessingPrompts:
         PROMPT_DENSE_SLIDE_SUMMARY=PROMPT_DENSE_SLIDE_SUMMARY,
         PROMPT_SEMANTIC_TEXT_SPLITTER=PROMPT_SEMANTIC_TEXT_SPLITTER,
         PROMPT_DENSE_REPORT_SUMMARY=PROMPT_DENSE_REPORT_SUMMARY,
+        PROMPT_VECTOR_CONTENT_SUMMARY=PROMPT_VECTOR_CONTENT_SUMMARY,
         PROMPT_VLM_TRANSCRIBE_SLIDE=PROMPT_VLM_TRANSCRIBE_SLIDE,
         PROMPT_VLM_DESCRIBE_IMAGES=PROMPT_VLM_DESCRIBE_IMAGES,
     )
