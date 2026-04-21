@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import re
 from pathlib import Path
@@ -63,19 +64,30 @@ def extract_json_object_text(text: str) -> str:
     return text[start_index : end_index + 1]
 
 
+def parse_structured_text(text: str) -> Any:
+    """Пробует безопасно разобрать строку как JSON или Python literal."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        return ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
 def parse_model_json_response(response_text: str) -> Any:
     """Разбирает JSON-ответ модели, включая случай, когда JSON был возвращен строкой внутри JSON."""
     candidate = strip_markdown_json_block(response_text)
     for _ in range(3):
-        try:
-            parsed_response = json.loads(candidate)
-        except json.JSONDecodeError:
+        parsed_response = parse_structured_text(candidate)
+        if parsed_response is None:
             json_object_text = extract_json_object_text(candidate)
             if json_object_text == candidate:
                 return None
-            try:
-                parsed_response = json.loads(json_object_text)
-            except json.JSONDecodeError:
+            parsed_response = parse_structured_text(json_object_text)
+            if parsed_response is None:
                 return None
 
         if isinstance(parsed_response, str):
@@ -93,10 +105,19 @@ def parse_model_json_response(response_text: str) -> Any:
 def extract_text_field_from_model_response(response_text: str, field_name: str) -> str:
     """Достает строковое поле из JSON-ответа модели или возвращает очищенный исходный ответ."""
     parsed_response = parse_model_json_response(response_text)
-    if isinstance(parsed_response, dict):
+    for _ in range(3):
+        if not isinstance(parsed_response, dict):
+            break
+
         field_value = parsed_response.get(field_name)
         if isinstance(field_value, str) and field_value.strip():
+            nested_response = parse_model_json_response(field_value)
+            if isinstance(nested_response, dict):
+                parsed_response = nested_response
+                continue
             return field_value.strip()
+        break
+
     return strip_markdown_json_block(response_text)
 
 
