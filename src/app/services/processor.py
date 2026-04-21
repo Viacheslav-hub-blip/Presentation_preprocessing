@@ -7,9 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import ast
-import json
-import re
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import UUID, uuid4
@@ -19,6 +16,11 @@ from src.app.prompts.prompts import ProcessingPrompts
 from src.app.models.processing import PresentationProcessingResult, SlideProcessingResult
 from src.app.services.file_extractors import load_markdown_slides, load_pdf_slides, load_pptx_slides
 from src.app.services.image_renderers import export_slide_images, render_pdf_page_images, resolve_slide_images
+from src.app.utils.model_responses import (
+    extract_structured_text_from_model_response,
+    extract_summary_from_model_response,
+    extract_text_field_from_model_response,
+)
 from src.vlm_client import QwenVLMClient
 
 
@@ -40,110 +42,6 @@ async def invoke_text_model(model: Any, prompt: str, retries: int = 5, delay_sec
             await asyncio.sleep(delay_seconds)
     assert last_error is not None
     raise last_error
-
-
-def strip_markdown_json_block(text: str) -> str:
-    """Убирает markdown-обёртку вокруг JSON-ответа модели, если она есть."""
-    cleaned_text = text.strip()
-    fenced_match = re.fullmatch(
-        r"```(?:json)?\s*(.*?)\s*```",
-        cleaned_text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if fenced_match:
-        return fenced_match.group(1).strip()
-    return cleaned_text
-
-
-def extract_json_object_text(text: str) -> str:
-    """Возвращает текст первого JSON-объекта из ответа модели, если он там есть."""
-    start_index = text.find("{")
-    end_index = text.rfind("}")
-    if start_index == -1 or end_index == -1 or end_index <= start_index:
-        return text
-    return text[start_index : end_index + 1]
-
-
-def parse_structured_text(text: str) -> Any:
-    """Пробует безопасно разобрать строку как JSON или Python literal."""
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        return ast.literal_eval(text)
-    except (SyntaxError, ValueError):
-        return None
-
-
-def parse_model_json_response(response_text: str) -> Any:
-    """Разбирает JSON-ответ модели, включая случай, когда JSON был возвращен строкой внутри JSON."""
-    candidate = strip_markdown_json_block(response_text)
-    for _ in range(3):
-        parsed_response = parse_structured_text(candidate)
-        if parsed_response is None:
-            json_object_text = extract_json_object_text(candidate)
-            if json_object_text == candidate:
-                return None
-            parsed_response = parse_structured_text(json_object_text)
-            if parsed_response is None:
-                return None
-
-        if isinstance(parsed_response, str):
-            nested_candidate = strip_markdown_json_block(parsed_response)
-            if nested_candidate == candidate:
-                return parsed_response
-            candidate = nested_candidate
-            continue
-
-        return parsed_response
-
-    return None
-
-
-def extract_text_field_from_model_response(response_text: str, field_name: str) -> str:
-    """Достает строковое поле из JSON-ответа модели или возвращает очищенный исходный ответ."""
-    parsed_response = parse_model_json_response(response_text)
-    for _ in range(3):
-        if not isinstance(parsed_response, dict):
-            break
-
-        field_value = parsed_response.get(field_name)
-        if isinstance(field_value, str) and field_value.strip():
-            nested_response = parse_model_json_response(field_value)
-            if isinstance(nested_response, dict):
-                parsed_response = nested_response
-                continue
-            return field_value.strip()
-        break
-
-    return strip_markdown_json_block(response_text)
-
-
-def extract_summary_from_model_response(response_text: str) -> str:
-    """Достаёт поле `summary` из JSON-ответа модели и возвращает чистый текст."""
-    return extract_text_field_from_model_response(response_text, "summary")
-
-
-def extract_structured_text_from_model_response(response_text: str) -> str:
-    """Преобразует JSON semantic splitter в человекочитаемый структурированный текст."""
-    parsed_response = parse_model_json_response(response_text)
-    if not isinstance(parsed_response, dict):
-        return strip_markdown_json_block(response_text)
-
-    parts: list[str] = []
-    fragments = parsed_response.get("fragments")
-    if isinstance(fragments, list):
-        parts.extend(str(fragment).strip() for fragment in fragments if str(fragment).strip())
-
-    notes = parsed_response.get("notes")
-    if isinstance(notes, str) and notes.strip() and notes.strip().lower() != "null":
-        parts.append(f"Примечание: {notes.strip()}")
-
-    if parts:
-        return "\n".join(parts)
-    return strip_markdown_json_block(response_text)
 
 
 def _join_slide_source_components(
@@ -415,7 +313,7 @@ def build_storage_records(
         id=processing_result.presentation_id,
         report_name=processing_result.report_name,
         text=processing_result.full_text,
-        summary=processing_result.final_summary,
+        summary=extract_summary_from_model_response(processing_result.final_summary),
         link_on_file=link_on_file or processing_result.source_pptx_path,
     )
     chunk_records = [
@@ -424,7 +322,7 @@ def build_storage_records(
             slide_sequence_number=slide.slide_number,
             chunk_number=1,
             source_slide_text=slide.source_slide_text,
-            chunk_summary=slide.final_slide_description,
+            chunk_summary=extract_summary_from_model_response(slide.final_slide_description),
         )
         for slide in processing_result.slides
     ]

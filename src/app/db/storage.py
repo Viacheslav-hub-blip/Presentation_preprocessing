@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Protocol, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from src.app.utils.model_responses import extract_summary_from_model_response
+
 DEFAULT_PRESENTATIONS_TABLE = "presentation_text_dev"
 DEFAULT_CHUNKS_TABLE = "chunk_text_dev"
 
@@ -105,25 +107,6 @@ class SQLAlchemyConnection:
         return QueryExecutionResult(rows=rows, rowcount=result.rowcount or 0)
 
 
-def _insert_presentation_on_connection(db: DatabaseConnection, config: RelationalDBConfig, record: PresentationRecord) -> None:
-    """Добавляет запись презентации в реляционную БД через переданное соединение."""
-    db.execute(
-        f"""
-        INSERT INTO {config.presentations_table} (
-            id, report_name, text, summary, link_on_file
-        )
-        VALUES (:id, :report_name, :text, :summary, :link_on_file);
-        """,
-        {
-            "id": record.presentation_id,
-            "report_name": record.report_name,
-            "text": record.text,
-            "summary": record.summary,
-            "link_on_file": record.link_on_file,
-        },
-    )
-
-
 def _upsert_presentation_on_connection(db: DatabaseConnection, config: RelationalDBConfig, record: PresentationRecord) -> None:
     """Создаёт или обновляет запись презентации через переданное соединение."""
     db.execute(
@@ -144,27 +127,6 @@ def _upsert_presentation_on_connection(db: DatabaseConnection, config: Relationa
             "text": record.text,
             "summary": record.summary,
             "link_on_file": record.link_on_file,
-        },
-    )
-
-
-def _insert_chunk_on_connection(db: DatabaseConnection, config: RelationalDBConfig, record: SlideChunkRecord) -> None:
-    """Добавляет один чанк слайда в реляционную БД через переданное соединение."""
-    db.execute(
-        f"""
-        INSERT INTO {config.chunks_table} (
-            presentation_id, slide_sequence_number, chunk_number, source_slide_text, chunk_summary
-        )
-        VALUES (
-            :presentation_id, :slide_sequence_number, :chunk_number, :source_slide_text, :chunk_summary
-        );
-        """,
-        {
-            "presentation_id": record.normalized_presentation_id,
-            "slide_sequence_number": record.slide_sequence_number,
-            "chunk_number": record.chunk_number,
-            "source_slide_text": record.source_slide_text,
-            "chunk_summary": record.chunk_summary,
         },
     )
 
@@ -287,12 +249,6 @@ def create_relational_tables(config: RelationalDBConfig) -> None:
         )
 
 
-def insert_presentation(config: RelationalDBConfig, record: PresentationRecord) -> None:
-    """Добавляет новую презентацию в реляционную БД."""
-    with get_db_connection(config.connection_string) as db:
-        _insert_presentation_on_connection(db, config, record)
-
-
 def upsert_presentation(config: RelationalDBConfig, record: PresentationRecord) -> None:
     """Создаёт или обновляет запись презентации в реляционной БД."""
     with get_db_connection(config.connection_string) as db:
@@ -366,39 +322,6 @@ def select_presentation_list(
     ]
 
 
-def update_presentation(
-    config: RelationalDBConfig,
-    presentation_id: UUID | str,
-    *,
-    report_name: str | None = None,
-    text: str | None = None,
-    summary: str | None = None,
-    link_on_file: str | None = None,
-) -> int:
-    """Обновляет выбранные поля презентации и возвращает число затронутых строк."""
-    fields = {
-        "report_name": report_name,
-        "text": text,
-        "summary": summary,
-        "link_on_file": link_on_file,
-    }
-    assignments = [f"{column} = :{column}" for column, value in fields.items() if value is not None]
-    if not assignments:
-        return 0
-    params = {column: value for column, value in fields.items() if value is not None}
-    params["presentation_id"] = str(presentation_id)
-    with get_db_connection(config.connection_string) as db:
-        result = db.execute(
-            f"""
-            UPDATE {config.presentations_table}
-            SET {", ".join(assignments)}
-            WHERE id = :presentation_id;
-            """,
-            params,
-        )
-    return result.rowcount
-
-
 def delete_presentation(config: RelationalDBConfig, presentation_id: UUID | str) -> int:
     """Удаляет презентацию и её чанки из реляционной БД."""
     with get_db_connection(config.connection_string) as db:
@@ -411,12 +334,6 @@ def delete_presentation(config: RelationalDBConfig, presentation_id: UUID | str)
             {"presentation_id": str(presentation_id)},
         )
     return result.rowcount
-
-
-def insert_chunk(config: RelationalDBConfig, record: SlideChunkRecord) -> None:
-    """Добавляет один чанк слайда в реляционную БД."""
-    with get_db_connection(config.connection_string) as db:
-        _insert_chunk_on_connection(db, config, record)
 
 
 def upsert_chunk(config: RelationalDBConfig, record: SlideChunkRecord) -> None:
@@ -463,42 +380,6 @@ def select_chunks(
         )
         for row in result.rows
     ]
-
-
-def update_chunk(
-    config: RelationalDBConfig,
-    presentation_id: UUID | str,
-    slide_sequence_number: int,
-    chunk_number: int,
-    *,
-    source_slide_text: str | None = None,
-    chunk_summary: str | None = None,
-) -> int:
-    """Обновляет выбранные поля чанка и возвращает число затронутых строк."""
-    fields = {"source_slide_text": source_slide_text, "chunk_summary": chunk_summary}
-    assignments = [f"{column} = :{column}" for column, value in fields.items() if value is not None]
-    if not assignments:
-        return 0
-    params = {column: value for column, value in fields.items() if value is not None}
-    params.update(
-        {
-            "presentation_id": str(presentation_id),
-            "slide_sequence_number": slide_sequence_number,
-            "chunk_number": chunk_number,
-        }
-    )
-    with get_db_connection(config.connection_string) as db:
-        result = db.execute(
-            f"""
-            UPDATE {config.chunks_table}
-            SET {", ".join(assignments)}
-            WHERE presentation_id = :presentation_id
-              AND slide_sequence_number = :slide_sequence_number
-              AND chunk_number = :chunk_number;
-            """,
-            params,
-        )
-    return result.rowcount
 
 
 def delete_chunks(
@@ -600,7 +481,7 @@ def build_report_vector_document(record: PresentationRecord) -> Any:
     document_cls, _, _ = _import_vector_dependencies()
     return document_cls(
         id=record.presentation_id,
-        page_content=record.summary or "",
+        page_content=extract_summary_from_model_response(record.summary),
         metadata={
             "unique_id": f"{record.presentation_id}+report",
             "presentation_id": record.presentation_id,
@@ -631,7 +512,7 @@ def build_chunk_vector_document(report_name: str, chunk: SlideChunkRecord, *, to
     )
     return document_cls(
         id=chunk_id,
-        page_content=chunk.chunk_summary or "",
+        page_content=extract_summary_from_model_response(chunk.chunk_summary),
         metadata={
             "unique_id": (
                 f"{chunk.normalized_presentation_id}+slide{chunk.slide_sequence_number}"
@@ -645,14 +526,6 @@ def build_chunk_vector_document(report_name: str, chunk: SlideChunkRecord, *, to
             "type": "slide_chunk",
         },
     )
-
-
-async def add_vector_documents(vector_store: Any, documents: Iterable[Any]) -> Any:
-    """Добавляет документы в векторное хранилище."""
-    document_list = list(documents)
-    if not document_list:
-        return []
-    return await vector_store.aadd_documents(document_list)
 
 
 async def delete_vector_documents(vector_store: Any, document_ids: Sequence[str]) -> Any:
@@ -671,20 +544,6 @@ async def update_vector_documents(vector_store: Any, documents: Iterable[Any]) -
     if not document_list:
         return []
     return await vector_store.aadd_documents(document_list)
-
-
-async def select_vector_documents(
-    vector_store: Any,
-    query: str,
-    *,
-    k: int = 4,
-    filters: Optional[dict[str, Any]] = None,
-) -> Any:
-    """Выполняет similarity search в векторном хранилище."""
-    search_kwargs: dict[str, Any] = {"query": query, "k": k}
-    if filters:
-        search_kwargs["filter"] = filters
-    return await vector_store.asimilarity_search(**search_kwargs)
 
 
 async def delete_presentation_from_vector_db(
