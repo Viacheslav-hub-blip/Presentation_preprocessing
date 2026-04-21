@@ -19,6 +19,7 @@ class SlideProcessingResult:
     llm_structured_text: str
     vlm_transcribed_text: str
     vlm_visual_description: str
+    source_slide_text: str
     final_slide_description: str
 
 
@@ -30,6 +31,7 @@ class PresentationProcessingResult:
     report_name: str
     source_pptx_path: str
     additional_context: str = ""
+    report_summary: str = ""
     slides: list[SlideProcessingResult] = field(default_factory=list)
 
     @property
@@ -40,6 +42,8 @@ class PresentationProcessingResult:
     @property
     def final_summary(self) -> str:
         """Формирует итоговое описание презентации из описаний слайдов и допконтекста."""
+        if self.report_summary.strip():
+            return self.report_summary.strip()
         base_summary = "\n\n".join(
             f"### СЛАЙД {slide.slide_number}\n{slide.final_slide_description}"
             for slide in self.slides

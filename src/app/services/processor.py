@@ -21,6 +21,10 @@ from src.app.services.image_renderers import export_slide_images, render_pdf_pag
 from src.vlm_client import QwenVLMClient
 
 
+PRESENTATION_SUMMARY_MAX_CHARS = 4096
+PRESENTATION_SUMMARY_TARGET_CHARS = 3500
+
+
 async def invoke_text_model(model: Any, prompt: str, retries: int = 5, delay_seconds: float = 1.0) -> str:
     """Вызывает текстовую модель с повторными попытками при временных сбоях."""
     last_error: Exception | None = None
@@ -59,26 +63,121 @@ def extract_json_object_text(text: str) -> str:
     return text[start_index : end_index + 1]
 
 
+def parse_model_json_response(response_text: str) -> Any:
+    """Разбирает JSON-ответ модели, включая случай, когда JSON был возвращен строкой внутри JSON."""
+    candidate = strip_markdown_json_block(response_text)
+    for _ in range(3):
+        try:
+            parsed_response = json.loads(candidate)
+        except json.JSONDecodeError:
+            json_object_text = extract_json_object_text(candidate)
+            if json_object_text == candidate:
+                return None
+            try:
+                parsed_response = json.loads(json_object_text)
+            except json.JSONDecodeError:
+                return None
+
+        if isinstance(parsed_response, str):
+            nested_candidate = strip_markdown_json_block(parsed_response)
+            if nested_candidate == candidate:
+                return parsed_response
+            candidate = nested_candidate
+            continue
+
+        return parsed_response
+
+    return None
+
+
+def extract_text_field_from_model_response(response_text: str, field_name: str) -> str:
+    """Достает строковое поле из JSON-ответа модели или возвращает очищенный исходный ответ."""
+    parsed_response = parse_model_json_response(response_text)
+    if isinstance(parsed_response, dict):
+        field_value = parsed_response.get(field_name)
+        if isinstance(field_value, str) and field_value.strip():
+            return field_value.strip()
+    return strip_markdown_json_block(response_text)
+
+
 def extract_summary_from_model_response(response_text: str) -> str:
     """Достаёт поле `summary` из JSON-ответа модели и возвращает чистый текст."""
-    cleaned_text = strip_markdown_json_block(response_text)
-    try:
-        parsed_response = json.loads(cleaned_text)
-    except json.JSONDecodeError:
-        json_object_text = extract_json_object_text(cleaned_text)
-        try:
-            parsed_response = json.loads(json_object_text)
-        except json.JSONDecodeError:
-            return cleaned_text
+    return extract_text_field_from_model_response(response_text, "summary")
 
+
+def extract_structured_text_from_model_response(response_text: str) -> str:
+    """Преобразует JSON semantic splitter в человекочитаемый структурированный текст."""
+    parsed_response = parse_model_json_response(response_text)
     if not isinstance(parsed_response, dict):
-        return cleaned_text
+        return strip_markdown_json_block(response_text)
 
-    summary = parsed_response.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
-        return cleaned_text
+    parts: list[str] = []
+    fragments = parsed_response.get("fragments")
+    if isinstance(fragments, list):
+        parts.extend(str(fragment).strip() for fragment in fragments if str(fragment).strip())
 
-    return summary.strip()
+    notes = parsed_response.get("notes")
+    if isinstance(notes, str) and notes.strip() and notes.strip().lower() != "null":
+        parts.append(f"Примечание: {notes.strip()}")
+
+    if parts:
+        return "\n".join(parts)
+    return strip_markdown_json_block(response_text)
+
+
+def _join_slide_source_components(
+    *,
+    slide_number: int,
+    llm_structured_text: str,
+    vlm_transcribed_text: str,
+    vlm_visual_description: str,
+) -> str:
+    """Собирает fallback-версию source-текста без служебных metadata, если LLM не вернула source_text."""
+    parts = [
+        f"Слайд {slide_number}",
+        "Структурированный текст слайда:",
+        llm_structured_text,
+    ]
+    if vlm_transcribed_text:
+        parts.extend(["Текст, распознанный по изображению:", vlm_transcribed_text])
+    if vlm_visual_description:
+        parts.extend(["Описание визуальных элементов:", vlm_visual_description])
+    return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+
+async def build_slide_source_text(
+    *,
+    report_name: str,
+    slide_number: int,
+    pptx_extracted_text: str,
+    llm_structured_text: str,
+    vlm_transcribed_text: str,
+    vlm_visual_description: str,
+    text_model: Any,
+    prompts: ProcessingPrompts,
+) -> str:
+    """Строит единый нормализованный source-текст слайда через LLM на основе PPTX, LLM и VLM данных."""
+    raw_source_text = await invoke_text_model(
+        text_model,
+        prompts.PROMPT_BUILD_SLIDE_SOURCE_TEXT.format(
+            report_name=report_name,
+            slide_number=slide_number,
+            pptx_extracted_text=pptx_extracted_text,
+            llm_structured_text=llm_structured_text,
+            vlm_transcribed_text=vlm_transcribed_text,
+            vlm_visual_description=vlm_visual_description,
+        ),
+    )
+    source_text = extract_text_field_from_model_response(raw_source_text, "source_text").strip()
+    if source_text:
+        return source_text
+
+    return _join_slide_source_components(
+        slide_number=slide_number,
+        llm_structured_text=llm_structured_text or pptx_extracted_text,
+        vlm_transcribed_text=vlm_transcribed_text,
+        vlm_visual_description=vlm_visual_description,
+    )
 
 
 async def process_slide(
@@ -127,18 +226,32 @@ async def process_slide(
         vlm_transcribed_text = ""
         vlm_visual_description = ""
 
+    llm_structured_text = extract_structured_text_from_model_response(llm_structured_text)
+    vlm_transcribed_text = extract_text_field_from_model_response(vlm_transcribed_text, "transcribed_text")
+    vlm_visual_description = extract_text_field_from_model_response(vlm_visual_description, "description")
+    source_slide_text = await build_slide_source_text(
+        report_name=report_name,
+        slide_number=slide_index + 1,
+        pptx_extracted_text=slide_text,
+        llm_structured_text=llm_structured_text,
+        vlm_transcribed_text=vlm_transcribed_text,
+        vlm_visual_description=vlm_visual_description,
+        text_model=text_model,
+        prompts=prompts,
+    )
+
     raw_final_slide_description = await invoke_text_model(
         text_model,
         prompts.PROMPT_DENSE_SLIDE_SUMMARY.format(
             report_name=report_name,
             slide_number=slide_index + 1,
-            text=slide_text,
-            slide_text=slide_text,
-            original_text=slide_text,
-            pptx_extracted_text=slide_text,
-            llm_structured_text=llm_structured_text,
-            vlm_transcribed_text=vlm_transcribed_text,
-            vlm_visual_description=vlm_visual_description,
+            text=source_slide_text,
+            slide_text=source_slide_text,
+            original_text=source_slide_text,
+            pptx_extracted_text=source_slide_text,
+            llm_structured_text=source_slide_text,
+            vlm_transcribed_text="",
+            vlm_visual_description="",
         ),
     )
     final_slide_description = extract_summary_from_model_response(raw_final_slide_description)
@@ -150,8 +263,39 @@ async def process_slide(
         llm_structured_text=llm_structured_text,
         vlm_transcribed_text=vlm_transcribed_text,
         vlm_visual_description=vlm_visual_description,
+        source_slide_text=source_slide_text,
         final_slide_description=final_slide_description,
     )
+
+
+async def build_presentation_summary(
+    *,
+    report_name: str,
+    slides: Sequence[SlideProcessingResult],
+    additional_context: str,
+    text_model: Any,
+    prompts: ProcessingPrompts,
+) -> str:
+    """Строит единый summary презентации через LLM и ограничивает его лимитом embeddings-модели."""
+    summary_source = _build_presentation_summary_source(
+        slides=slides,
+        additional_context=additional_context,
+    )
+    if not summary_source:
+        return ""
+
+    raw_summary = await invoke_text_model(
+        text_model,
+        prompts.PROMPT_DENSE_REPORT_SUMMARY.format(
+            report_name=report_name,
+            text=summary_source,
+            max_chars=PRESENTATION_SUMMARY_TARGET_CHARS,
+        ),
+    )
+    summary = extract_summary_from_model_response(raw_summary).strip()
+    if len(summary) <= PRESENTATION_SUMMARY_MAX_CHARS:
+        return summary
+    return summary[:PRESENTATION_SUMMARY_MAX_CHARS].rstrip()
 
 
 async def process_presentation(
@@ -220,13 +364,23 @@ async def process_presentation(
         for slide_index, (slide_text, image_path) in enumerate(zip(slides, effective_images))
     ]
     slide_results = await asyncio.gather(*tasks)
+    sorted_slide_results = sorted(slide_results, key=lambda slide: slide.slide_number)
+    normalized_additional_context = (additional_context or "").strip()
+    report_summary = await build_presentation_summary(
+        report_name=effective_report_name,
+        slides=sorted_slide_results,
+        additional_context=normalized_additional_context,
+        text_model=text_model,
+        prompts=prompts,
+    )
 
     return PresentationProcessingResult(
         presentation_id=normalized_presentation_id,
         report_name=effective_report_name,
         source_pptx_path=str(source_path),
-        additional_context=(additional_context or "").strip(),
-        slides=sorted(slide_results, key=lambda slide: slide.slide_number),
+        additional_context=normalized_additional_context,
+        report_summary=report_summary,
+        slides=sorted_slide_results,
     )
 
 
@@ -248,12 +402,7 @@ def build_storage_records(
             presentation_id=processing_result.presentation_id,
             slide_sequence_number=slide.slide_number,
             chunk_number=1,
-            source_slide_text=_combine_slide_sources(
-                processing_result=processing_result,
-                slide=slide,
-                chunk_number=1,
-                total_chunks=1,
-            ),
+            source_slide_text=slide.source_slide_text,
             chunk_summary=slide.final_slide_description,
         )
         for slide in processing_result.slides
@@ -261,41 +410,25 @@ def build_storage_records(
     return presentation_record, chunk_records
 
 
-def _combine_slide_sources(
+def _build_presentation_summary_source(
     *,
-    processing_result: PresentationProcessingResult,
-    slide: SlideProcessingResult,
-    chunk_number: int,
-    total_chunks: int,
+    slides: Sequence[SlideProcessingResult],
+    additional_context: str,
 ) -> str:
-    """Склеивает все источники данных по слайду в один текст для хранения."""
-    metadata_lines = [
-        "CHUNK_METADATA:",
-        f"unique_id={processing_result.presentation_id}+slide{slide.slide_number}+chunk{chunk_number}",
-        f"presentation_id={processing_result.presentation_id}",
-        f"slide_number={slide.slide_number}",
-        f"chunk_number={chunk_number}",
-        f"total_chunks={total_chunks}",
-        "type=slide_chunk",
-        f"report_name={processing_result.report_name}",
-    ]
+    """Собирает входной текст для LLM-суммаризации всей презентации."""
     parts = [
-        "\n".join(metadata_lines),
-        f"РЎР»Р°Р№Рґ {slide.slide_number}",
-        "PPTX_EXTRACTED_TEXT:",
-        slide.original_text,
-        "LLM_STRUCTURED_TEXT:",
-        slide.llm_structured_text,
-        "VLM_TRANSCRIBED_TEXT:",
-        slide.vlm_transcribed_text,
-        "VLM_VISUAL_DESCRIPTION:",
-        slide.vlm_visual_description,
+        f"[Слайд {slide.slide_number}] {slide.final_slide_description}"
+        for slide in slides
+        if slide.final_slide_description
     ]
-    return "\n".join(part for part in parts if part)
+    if additional_context.strip():
+        parts.append(f"[Дополнительная информация] {additional_context.strip()}")
+    return "\n---\n".join(parts)
 
 
 __all__ = [
     "build_storage_records",
+    "build_slide_source_text",
     "export_slide_images",
     "invoke_text_model",
     "load_markdown_slides",

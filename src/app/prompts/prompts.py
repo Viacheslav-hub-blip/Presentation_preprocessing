@@ -16,6 +16,7 @@ class ProcessingPrompts:
     PROMPT_EXTRACT_DATE_FROM_SLIDES: str
     PROMPT_DENSE_SLIDE_SUMMARY: str
     PROMPT_SEMANTIC_TEXT_SPLITTER: str
+    PROMPT_BUILD_SLIDE_SOURCE_TEXT: str
     PROMPT_DENSE_REPORT_SUMMARY: str
     PROMPT_VECTOR_CONTENT_SUMMARY: str
     PROMPT_VLM_TRANSCRIBE_SLIDE: str
@@ -377,6 +378,54 @@ PROMPT_SEMANTIC_TEXT_SPLITTER = """
 """
 
 
+PROMPT_BUILD_SLIDE_SOURCE_TEXT = """
+<role>
+    Ты — эксперт по подготовке единого исходного текста слайда презентации для дальнейшей суммаризации и RAG.
+</role>
+
+<task>
+    Объедини данные одного слайда из PPTX, LLM-структурирования, VLM-транскрибации и VLM-описания в один связный source_text.
+    Это не summary. Нужно получить нормальную, полную и читаемую версию текста слайда, на основе которой потом будет строиться summary и вектор.
+</task>
+
+<output_format>
+    Верни строго один JSON-объект без markdown и без пояснений вне JSON:
+    {{
+        "source_text": "единый нормализованный текст слайда"
+    }}
+</output_format>
+
+<instructions>
+    1. Объедини все полезные факты из источников в один связный текст.
+    2. Убери дубли между PPTX, LLM и VLM, но не теряй смысл, числа, даты, названия, метрики, KPI, аббревиатуры и расшифровки.
+    3. Не делай краткое summary и не сокращай важные детали: source_text должен быть исходной собранной версией слайда.
+    4. Если есть таблицы или списки, передай их в читаемом текстовом виде.
+    5. Не добавляй служебные поля: chunk_metadata, unique_id, presentation_id, slide_number, chunk_number, total_chunks, type.
+    6. Не используй markdown-обертки, тройные кавычки, ```json, специальные декоративные символы и комментарии вне JSON.
+    7. Не добавляй факты от себя. Если источники противоречат друг другу, сохрани более полный вариант и не придумывай объяснение.
+</instructions>
+
+<context>
+    report_name: {report_name}
+    slide_number: {slide_number}
+</context>
+
+<input_data>
+    PPTX_EXTRACTED_TEXT:
+    {pptx_extracted_text}
+
+    LLM_STRUCTURED_TEXT:
+    {llm_structured_text}
+
+    VLM_TRANSCRIBED_TEXT:
+    {vlm_transcribed_text}
+
+    VLM_VISUAL_DESCRIPTION:
+    {vlm_visual_description}
+</input_data>
+"""
+
+
 PROMPT_DENSE_REPORT_SUMMARY = """
 <role>
     Ты — профессиональный аналитик в отделе антифрода банка (противодействие мошенничеству).
@@ -384,6 +433,7 @@ PROMPT_DENSE_REPORT_SUMMARY = """
 
 <task>
     Твоя задача — составить краткое содержание для всей презентации на основе текстов её слайдов.
+    Итоговый summary должен быть короче {max_chars} символов, потому что по нему будет строиться вектор презентации.
 </task>
 
 <input_format>
@@ -392,7 +442,10 @@ PROMPT_DENSE_REPORT_SUMMARY = """
 </input_format>
 
 <output_format>
-    Верни только краткое содержание без лишних пояснений, markdown и специальных символов.
+    Верни строго один JSON-объект без markdown и без пояснений вне JSON:
+    {{
+        "summary": "краткое содержание всей презентации короче {max_chars} символов"
+    }}
 </output_format>
 
 <instructions>
@@ -529,6 +582,7 @@ def get_processing_prompts() -> ProcessingPrompts:
         PROMPT_EXTRACT_DATE_FROM_SLIDES=PROMPT_EXTRACT_DATE_FROM_SLIDES,
         PROMPT_DENSE_SLIDE_SUMMARY=PROMPT_DENSE_SLIDE_SUMMARY,
         PROMPT_SEMANTIC_TEXT_SPLITTER=PROMPT_SEMANTIC_TEXT_SPLITTER,
+        PROMPT_BUILD_SLIDE_SOURCE_TEXT=PROMPT_BUILD_SLIDE_SOURCE_TEXT,
         PROMPT_DENSE_REPORT_SUMMARY=PROMPT_DENSE_REPORT_SUMMARY,
         PROMPT_VECTOR_CONTENT_SUMMARY=PROMPT_VECTOR_CONTENT_SUMMARY,
         PROMPT_VLM_TRANSCRIBE_SLIDE=PROMPT_VLM_TRANSCRIBE_SLIDE,
